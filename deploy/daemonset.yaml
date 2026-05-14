@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: resource-claim-image-configurator
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: resource-claim-image-configurator
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/driver"]
+    resourceNames: ["gpu.example.com", "cpu.example.com", "image.example.com"]
+    verbs: ["associated-node:update", "arbitrary-node:update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: resource-claim-image-configurator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: resource-claim-image-configurator
+subjects:
+  - kind: ServiceAccount
+    name: resource-claim-image-configurator
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: resource-claim-image-configurator
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: resource-claim-image-configurator
+  template:
+    metadata:
+      labels:
+        app: resource-claim-image-configurator
+    spec:
+      serviceAccountName: resource-claim-image-configurator
+      containers:
+        - name: controller
+          image: registry.k8s.io/resource-claim-image-configurator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
