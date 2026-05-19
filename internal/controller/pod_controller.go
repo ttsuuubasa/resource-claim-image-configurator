@@ -21,8 +21,7 @@ const bindingConditionValidateImage = "BindingConditions"
 // PodReconciler watches Pods nominated to this node and patches their
 // container images based on the associated ResourceClaim config.
 type PodReconciler struct {
-	Client   client.Client
-	NodeName string
+	Client client.Client
 }
 
 // SetupWithManager registers the controller with the manager.

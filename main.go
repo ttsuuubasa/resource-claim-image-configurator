@@ -40,8 +40,7 @@ func main() {
 	}
 
 	if err := (&controller.PodReconciler{
-		Client:   mgr.GetClient(),
-		NodeName: nodeName,
+		Client: mgr.GetClient(),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller")
 		os.Exit(1)
