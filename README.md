@@ -27,6 +27,7 @@ The flow:
 
 - Kubernetes v1.34+ with `DynamicResourceAllocation` and `DRADeviceBindingConditions` feature gates enabled
 - [dra-example-driver](https://github.com/kubernetes-sigs/dra-example-driver) deployed as the DRA driver
+  - The `BindingConditions` implementation is currently under development: [kubernetes-sigs/dra-example-driver#199](https://github.com/kubernetes-sigs/dra-example-driver/pull/199)
 
 ## Setup
 
