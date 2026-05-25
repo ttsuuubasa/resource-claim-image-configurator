@@ -16,7 +16,8 @@ import (
 	imagev1alpha1 "github.com/ttsuuubasa/resource-claim-image-configurator/api/v1alpha1"
 )
 
-const bindingConditionValidateImage = "BindingConditions"
+const BindingConditionValidateImage = "image-verified"
+const BindingFailuerConditionPrepareImage = "image-prepare-failed"
 
 // PodReconciler watches Pods nominated to this node and patches their
 // container images based on the associated ResourceClaim config.
@@ -99,10 +100,10 @@ func (r *PodReconciler) parseImageConfigs(ctx context.Context, pod *corev1.Pod) 
 		// Find requests whose "validate-image" condition is still pending.
 		var pendingResults []resourceapi.DeviceRequestAllocationResult
 		for _, result := range claim.Status.Allocation.Devices.Results {
-			if !slices.Contains(result.BindingConditions, bindingConditionValidateImage) {
+			if !slices.Contains(result.BindingConditions, BindingConditionValidateImage) {
 				continue
 			}
-			if isBindingConditionAlreadySet(&claim, &result, bindingConditionValidateImage) {
+			if isBindingConditionAlreadySet(&claim, &result, BindingConditionValidateImage) {
 				continue
 			}
 			pendingResults = append(pendingResults, result)
@@ -187,7 +188,7 @@ func (r *PodReconciler) setBindingConditions(ctx context.Context, cp claimPatch)
 			Pool:   d.Result.Pool,
 			Device: d.Result.Device,
 			Conditions: []metav1.Condition{{
-				Type:               bindingConditionValidateImage,
+				Type:               BindingConditionValidateImage,
 				Status:             metav1.ConditionTrue,
 				LastTransitionTime: now,
 				Reason:             "ImagePatched",

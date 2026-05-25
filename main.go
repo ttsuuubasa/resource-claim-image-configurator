@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -12,7 +14,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	controller "github.com/ttsuuubasa/resource-claim-image-configurator/internal/controller"
+	"k8s.io/client-go/kubernetes"
+	resourceslice "k8s.io/dynamic-resource-allocation/resourceslice"
 )
+
+const DriverName = "image.example.com"
 
 func main() {
 	ctrl.SetLogger(zap.New())
@@ -24,7 +30,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// Start the DRA ResourceSlice controller before manager
+	config := ctrl.GetConfigOrDie()
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to create kubeClient: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Start the DRA ResourceSlice controller before manager
+	_, err = resourceslice.StartController(
+		context.Background(),
+		resourceslice.Options{
+			DriverName: DriverName,
+			KubeClient: kubeClient,
+			Resources:  makeDriverResources(),
+		},
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to start ResourceSlice controller: %v\n", err)
+		os.Exit(1)
+	}
+
+	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				// Cache only pods nominated to this node.
@@ -50,5 +78,29 @@ func main() {
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited")
 		os.Exit(1)
+	}
+}
+
+// makeDriverResources returns DriverResources for publishing ResourceSlices.
+func makeDriverResources() *resourceslice.DriverResources {
+	return &resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{
+			"all-nodes": {
+				AllNodes: true,
+				Slices: []resourceslice.Slice{
+					{
+						Devices: []v1.Device{
+							{
+								Name:                     "image-configurator",
+								AllowMultipleAllocations: new(true),
+								BindsToNode:              new(true),
+								BindingConditions:        []string{controller.BindingConditionValidateImage},
+								BindingFailureConditions: []string{controller.BindingFailuerConditionPrepareImage},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 }

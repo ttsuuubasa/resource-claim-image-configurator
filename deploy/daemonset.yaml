@@ -22,6 +22,9 @@ rules:
     resources: ["resourceclaims/driver"]
     resourceNames: ["gpu.example.com", "cpu.example.com", "image.example.com"]
     verbs: ["associated-node:update", "arbitrary-node:update"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
