@@ -1,0 +1,34 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-or-cpu
+spec:
+  spec:
+    devices:
+      requests:
+        - name: device
+          firstAvailable:
+            - name: gpu
+              deviceClassName: gpu.example.com
+            - name: cpu
+              deviceClassName: cpu.example.com
+        - name: image-config
+          exactly:
+            deviceClassName: image.example.com
+      config:
+        - requests: ["device/gpu"]
+          opaque:
+            driver: image.example.com
+            parameters:
+              apiVersion: image.example.com/v1alpha1
+              kind: ImageConfig
+              containerName: app
+              image: fedora:latest
+        - requests: ["device/cpu"]
+          opaque:
+            driver: image.example.com
+            parameters:
+              apiVersion: image.example.com/v1alpha1
+              kind: ImageConfig
+              containerName: app
+              image: ubuntu:latest

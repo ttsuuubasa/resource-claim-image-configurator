@@ -1,0 +1,8 @@
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: image.example.com
+spec:
+  selectors:
+  - cel:
+      expression: device.driver == 'image.example.com'
