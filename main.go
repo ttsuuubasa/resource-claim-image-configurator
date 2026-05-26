@@ -93,7 +93,7 @@ func makeDriverResources() *resourceslice.DriverResources {
 							{
 								Name:                     "image-configurator",
 								AllowMultipleAllocations: new(true),
-								BindsToNode:              new(true),
+								BindsToNode:              new(false),
 								BindingConditions:        []string{controller.BindingConditionValidateImage},
 								BindingFailureConditions: []string{controller.BindingFailuerConditionPrepareImage},
 							},

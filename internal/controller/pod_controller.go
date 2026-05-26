@@ -32,16 +32,12 @@ func (r *PodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// devicePatch pairs an allocation result with the ImageConfig resolved from it.
-type devicePatch struct {
-	Result resourceapi.DeviceRequestAllocationResult
-	Config imagev1alpha1.ImageConfig
-}
-
-// claimPatch holds a ResourceClaim and the per-device patches to apply.
+// claimPatch holds a ResourceClaim, the resolved ImageConfig to apply, and the
+// result whose binding condition must be satisfied afterward.
 type claimPatch struct {
-	Claim   *resourceapi.ResourceClaim
-	Devices []devicePatch
+	Claim          *resourceapi.ResourceClaim
+	ImageConfigs   []*imagev1alpha1.ImageConfig
+	BindingResults []resourceapi.DeviceRequestAllocationResult
 }
 
 // Reconcile handles a single Pod event.
@@ -97,25 +93,27 @@ func (r *PodReconciler) parseImageConfigs(ctx context.Context, pod *corev1.Pod) 
 			return nil, fmt.Errorf("claim %s not yet allocated", claimKey)
 		}
 
+		allocatedDevices := claim.Status.Allocation.Devices
+
 		// Find requests whose "validate-image" condition is still pending.
-		var pendingResults []resourceapi.DeviceRequestAllocationResult
-		for _, result := range claim.Status.Allocation.Devices.Results {
+		var bindingResults []resourceapi.DeviceRequestAllocationResult
+		for _, result := range allocatedDevices.Results {
 			if !slices.Contains(result.BindingConditions, BindingConditionValidateImage) {
 				continue
 			}
 			if isBindingConditionAlreadySet(&claim, &result, BindingConditionValidateImage) {
 				continue
 			}
-			pendingResults = append(pendingResults, result)
+			bindingResults = append(bindingResults, result)
 		}
-		if len(pendingResults) == 0 {
+		if len(bindingResults) == 0 {
 			continue
 		}
 
 		// For each pending result, find the config targeting it.
-		var devices []devicePatch
-		for _, result := range pendingResults {
-			for _, cfg := range claim.Status.Allocation.Devices.Config {
+		var imageConfigs []*imagev1alpha1.ImageConfig
+		for _, result := range allocatedDevices.Results {
+			for _, cfg := range allocatedDevices.Config {
 				if cfg.Opaque == nil || cfg.Opaque.Parameters.Raw == nil {
 					continue
 				}
@@ -130,14 +128,15 @@ func (r *PodReconciler) parseImageConfigs(ctx context.Context, pod *corev1.Pod) 
 				if !ok || ic.ContainerName == "" || ic.Image == "" {
 					continue
 				}
-				devices = append(devices, devicePatch{Result: result, Config: *ic})
+				imageConfigs = append(imageConfigs, ic)
 			}
 		}
 
-		if len(devices) > 0 {
+		if len(imageConfigs) > 0 {
 			patches = append(patches, claimPatch{
-				Claim:   &claim,
-				Devices: devices,
+				Claim:          &claim,
+				ImageConfigs:   imageConfigs,
+				BindingResults: bindingResults,
 			})
 		}
 	}
@@ -165,9 +164,9 @@ func isBindingConditionAlreadySet(claim *resourceapi.ResourceClaim, result *reso
 func (r *PodReconciler) patchImages(ctx context.Context, pod *corev1.Pod, patches []claimPatch) error {
 	for i := range pod.Spec.Containers {
 		for _, p := range patches {
-			for _, d := range p.Devices {
-				if pod.Spec.Containers[i].Name == d.Config.ContainerName {
-					pod.Spec.Containers[i].Image = d.Config.Image
+			for _, ic := range p.ImageConfigs {
+				if pod.Spec.Containers[i].Name == ic.ContainerName {
+					pod.Spec.Containers[i].Image = ic.Image
 				}
 			}
 		}
@@ -179,14 +178,15 @@ func (r *PodReconciler) patchImages(ctx context.Context, pod *corev1.Pod, patche
 }
 
 // setBindingConditions sets the "validate-image" binding condition to True
-// on the claim's Status.Devices for each device in the patch.
+// on the claim's Status.Devices for each binding result in the patch.
 func (r *PodReconciler) setBindingConditions(ctx context.Context, cp claimPatch) error {
 	now := metav1.Now()
-	for _, d := range cp.Devices {
+	for _, result := range cp.BindingResults {
 		cp.Claim.Status.Devices = append(cp.Claim.Status.Devices, resourceapi.AllocatedDeviceStatus{
-			Driver: d.Result.Driver,
-			Pool:   d.Result.Pool,
-			Device: d.Result.Device,
+			Driver:  result.Driver,
+			Pool:    result.Pool,
+			Device:  result.Device,
+			ShareID: (*string)(result.ShareID),
 			Conditions: []metav1.Condition{{
 				Type:               BindingConditionValidateImage,
 				Status:             metav1.ConditionTrue,
