@@ -1,94 +1,157 @@
 # resource-claim-image-configurator
 
-Proof-of-concept controller demonstrating how DRA Device Binding Conditions (KEP-5007) can enable runtime container image selection based on device allocation results.
+Proof-of-concept controller demonstrating how DRA Device Binding Conditions (KEP-5007) can enable workload fungibility — allowing the runtime container image to be selected automatically based on which device the scheduler actually allocates.
 
-The goal of this PoC is to validate a future API extension where `BindingConditions` would be specified directly in the ResourceClaim, allowing an external controller to mutate a Pod's container image after the scheduler decides which device to allocate. In this PoC, we emulate that behavior by declaring `BindingConditions` on the ResourceSlice side (via the DRA driver), since the ResourceClaim-side API does not yet exist.
+## Motivation
 
-## Overview
+Consider an inference service that scales horizontally. Each Pod prefers a GPU for performance, but when GPU supply is exhausted — whether due to cluster capacity limits or cloud provider quota — the service should continue scaling by falling back to CPU-based inference rather than failing. DRA's `firstAvailable` prioritized list handles the scheduling side of this: declare GPU as the first choice and CPU as the fallback, and the scheduler does the right thing automatically.
 
-When a Pod requests a device via DRA (Dynamic Resource Allocation) with a prioritized list (`firstAvailable`), the scheduler picks the best available device.
-This controller inspects the allocation result and patches the Pod's container image to match the allocated device, enabling runtime selection of device-specific images.
+The missing piece is the container image. A GPU inference workload and a CPU inference workload require different images, but the scheduler's choice is only known at scheduling time — too late to set the image upfront. Something needs to observe the allocation result and mutate the Pod's image before the kubelet starts the container.
 
-For example, given a `ResourceClaimTemplate` with GPU as the first priority and CPU as the fallback:
+This controller solves that problem. It reads which subrequest was satisfied, mutates the container image accordingly, and lets the Pod proceed — with no operator intervention and no failed Pods.
 
-- The first Pod is allocated a GPU device (`gpu.example.com`) because it has the highest priority. The controller reads the matching config from the ResourceClaim and patches the container image (e.g., `busybox:latest` → `fedora:latest`).
-- The second Pod cannot get a GPU because it is already occupied. The scheduler falls back to `cpu.example.com` via the prioritized list, and the controller patches the container image accordingly (e.g., `busybox:latest` → `ubuntu:latest`).
+See also: [KEP-5007 discussion](https://github.com/kubernetes/enhancements/pull/5487#discussion_r2382915417)
 
-The flow:
+## How it works
 
-1. User creates a `ResourceClaimTemplate` with a prioritized device request (`firstAvailable`) and opaque config that maps each subrequest to a container image.
-2. The scheduler allocates a device whose ResourceSlice declares `bindingConditions: ["BindingConditions"]`, blocking Pod startup until this controller acknowledges.
-   > **Note:** Since the ResourceClaim-side `BindingConditions` API does not yet exist, this PoC emulates the behavior by declaring `BindingConditions` on the ResourceSlice side (via the DRA driver).
-3. This controller detects the pending condition, reads the config from the claim's allocation result, and patches the Pod's container image to the one specified for the chosen subrequest.
-4. The controller marks the binding condition as satisfied (`status: "True"`, `reason: ImagePatched`).
-5. The kubelet proceeds to start the Pod with the correct image.
+The controller publishes a dedicated ResourceSlice for the `image.example.com` driver. This slice's device declares `bindingConditions: ["image-verified"]`, which causes the kubelet to block Pod startup until the condition is satisfied. Pods request this device alongside their actual compute device. When a Pod is pending, the controller reads the allocation result, determines which subrequest was chosen, mutates the container image, and then satisfies the binding condition to unblock the kubelet.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ ResourceClaimTemplate                                    │
+│                                                          │
+│  requests:                                               │
+│    device  (firstAvailable: gpu.example.com,             │
+│                              cpu.example.com)            │
+│    image-config (exactly: image.example.com)  ← gating   │
+│                                                          │
+│  config:                                                 │
+│    device/gpu → image: fedora:latest                     │
+│    device/cpu → image: ubuntu:latest                     │
+└──────────────────────────────────────────────────────────┘
+                         │
+                  Pod is created
+                         │
+              Scheduler allocates devices
+                         │
+┌──────────────────────────────────────────────────────────┐
+│ image-config device has BindingCondition "image-verified"│
+│ → kubelet blocks Pod startup                             │
+└──────────────────────────────────────────────────────────┘
+                         │
+        Controller detects pending condition
+                         │
+        Reads image config for the chosen subrequest
+        (device/gpu or device/cpu)
+                         │
+        Mutates Pod.spec.containers[*].image
+                         │
+        Sets BindingCondition status: True
+                         │
+              kubelet starts the Pod
+```
+
+### Components
+
+```mermaid
+graph TB
+    subgraph master["Control Plane"]
+        scheduler["Scheduler"]
+        apiserver["API Server"]
+    end
+
+    subgraph worker["Worker Node"]
+        kubelet["Kubelet"]
+        pod["Pod"]
+
+        subgraph plugins["Kubelet Plugins"]
+            dra_example["dra-example-driver\ngpu.example.com / cpu.example.com"]
+            dra_noop["dra-driver-noop\nimage.example.com"]
+        end
+
+        controller["resource-claim-image-configurator"]
+    end
+
+    dra_example -- "publishes ResourceSlice" --> apiserver
+    controller -- "publishes ResourceSlice / mutates Pod image" --> apiserver
+    apiserver -- "allocation result" --> scheduler
+    scheduler -- "allocates and nominates Pod" --> apiserver
+    apiserver -- "nominated Pod" --> kubelet
+    kubelet -- "PrepareResourceClaims" --> dra_example
+    kubelet -- "PrepareResourceClaims" --> dra_noop
+    kubelet -- "starts" --> pod
+```
+
+| Component | Role |
+|---|---|
+| **dra-example-driver** | Kubelet plugin for `gpu.example.com` and `cpu.example.com`. Publishes ResourceSlices with device attributes. No `BindingConditions` on these devices. |
+| **[dra-driver-noop](https://github.com/gke-labs/dra-drivers/tree/main/dra-driver-noop)** | Kubelet plugin for `image.example.com`. Registers with the kubelet and returns success for all Prepare/Unprepare calls without doing anything. Required because the kubelet must have a registered plugin for each driver name that appears in an allocation result. |
+| **resource-claim-image-configurator** (this controller) | Publishes a ResourceSlice for `image.example.com` with `bindingConditions: ["image-verified"]`. Watches Pods, mutates container images, and satisfies the binding condition. |
+
+The `image.example.com` ResourceSlice exposes a single shared device (`image-configurator`) with `allowMultipleAllocations: true` and `bindsToNode: false`, so it can be claimed by any number of Pods across all nodes simultaneously.
+
+> **Note:** The dra-driver-noop plugin may become unnecessary if [KEP-5945 (Optional Node Preparation)](https://github.com/kubernetes/enhancements/issues/5945) is implemented, which would allow DRA drivers to opt out of kubelet-side Prepare/Unprepare entirely.
 
 ## Prerequisites
 
-- Kubernetes v1.34+ with `DynamicResourceAllocation` and `DRADeviceBindingConditions` feature gates enabled
-- [dra-example-driver](https://github.com/kubernetes-sigs/dra-example-driver) deployed as the DRA driver
-  - The `BindingConditions` implementation is currently under development: [kubernetes-sigs/dra-example-driver#199](https://github.com/kubernetes-sigs/dra-example-driver/pull/199)
+- Kubernetes v1.34+ with feature gates `DynamicResourceAllocation` and `DRADeviceBindingConditions` enabled
+- [dra-example-driver](https://github.com/kubernetes-sigs/dra-example-driver) deployed for `gpu.example.com` and `cpu.example.com`
+- [dra-driver-noop](https://github.com/gke-labs/dra-drivers/tree/main/dra-driver-noop) deployed for `image.example.com`
 
 ## Setup
 
-### 1. Deploy dra-example-driver with two drivers
+### 1. Deploy dra-example-driver
 
-Follow the [dra-example-driver README](https://github.com/kubernetes-sigs/dra-example-driver/tree/main) to deploy the driver twice — once for `gpu.example.com` and once for `cpu.example.com`. Each instance creates ResourceSlices with `bindingConditions` on its devices.
+Follow the [dra-example-driver README](https://github.com/kubernetes-sigs/dra-example-driver) to deploy the driver twice — once for `gpu.example.com` and once for `cpu.example.com`. Each instance runs as a DaemonSet and creates a ResourceSlice per node.
 
-Verify that ResourceSlices are created with `bindingConditions`:
+Verify the ResourceSlices are present:
 
 ```bash
 kubectl get resourceslice
 ```
 
-Expected output:
+Expected output (before deploying the controller):
 
 ```
-NAME                                                            NODE                                DRIVER            POOL                                AGE
-00000-gpu.example.com-dra-example-driver-cluster-worker-xxxxx   dra-example-driver-cluster-worker   gpu.example.com   dra-example-driver-cluster-worker   1m
-00000-cpu.example.com-dra-example-driver-cluster-worker-xxxxx   dra-example-driver-cluster-worker   cpu.example.com   dra-example-driver-cluster-worker   1m
+NAME                                                            NODE                                DRIVER            POOL
+00000-cpu.example.com-dra-example-driver-cluster-worker-xxxxx   dra-example-driver-cluster-worker   cpu.example.com   dra-example-driver-cluster-worker
+00000-gpu.example.com-dra-example-driver-cluster-worker-xxxxx   dra-example-driver-cluster-worker   gpu.example.com   dra-example-driver-cluster-worker
 ```
-
-Each device in the ResourceSlice should have `bindingConditions` declared:
 
 <details>
-<summary>Full ResourceSlice YAML example (two drivers)</summary>
+<summary>Full ResourceSlice YAML (gpu.example.com and cpu.example.com)</summary>
 
 ```yaml
 apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:
-  creationTimestamp: "2026-05-19T08:18:51Z"
+  creationTimestamp: "2026-05-27T05:54:59Z"
   generateName: 00000-cpu.example.com-dra-example-driver-cluster-worker-
   generation: 1
-  name: 00000-cpu.example.com-dra-example-driver-cluster-worker-r9957
+  name: 00000-cpu.example.com-dra-example-driver-cluster-worker-85vdc
   ownerReferences:
-    - apiVersion: v1
-      controller: true
-      kind: Node
-      name: dra-example-driver-cluster-worker
-      uid: 46122907-4eaa-4e45-857c-fcad187eaeb6
-  resourceVersion: "1058"
-  uid: 711dd16a-41d0-4afd-9e1b-c3c34b50697e
+  - apiVersion: v1
+    controller: true
+    kind: Node
+    name: dra-example-driver-cluster-worker
+    uid: c436dc49-3913-436b-afb5-58fef7864f54
+  resourceVersion: "289571"
+  uid: 43df4aa9-56a4-450e-a174-a1fdb22f27bd
 spec:
   devices:
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 0
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-18db0e85-99e9-c746-8531-ffeb86328b39
-      bindingConditions:
-        - BindingConditions
-      bindingFailureConditions:
-        - BindingFailureConditions
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-0
+  - attributes:
+      driverVersion:
+        version: 1.0.0
+      index:
+        int: 0
+      model:
+        string: LATEST-GPU-MODEL
+      uuid:
+        string: gpu-18db0e85-99e9-c746-8531-ffeb86328b39
+    capacity:
+      memory:
+        value: 80Gi
+    name: gpu-0
   driver: cpu.example.com
   nodeName: dra-example-driver-cluster-worker
   pool:
@@ -99,37 +162,33 @@ spec:
 apiVersion: resource.k8s.io/v1
 kind: ResourceSlice
 metadata:
-  creationTimestamp: "2026-05-19T08:15:27Z"
+  creationTimestamp: "2026-05-27T05:54:59Z"
   generateName: 00000-gpu.example.com-dra-example-driver-cluster-worker-
-  generation: 2
-  name: 00000-gpu.example.com-dra-example-driver-cluster-worker-srjp9
+  generation: 1
+  name: 00000-gpu.example.com-dra-example-driver-cluster-worker-692rh
   ownerReferences:
-    - apiVersion: v1
-      controller: true
-      kind: Node
-      name: dra-example-driver-cluster-worker
-      uid: 46122907-4eaa-4e45-857c-fcad187eaeb6
-  resourceVersion: "963"
-  uid: 18ce8be4-b9b7-4878-b997-866a5dc5ba22
+  - apiVersion: v1
+    controller: true
+    kind: Node
+    name: dra-example-driver-cluster-worker
+    uid: c436dc49-3913-436b-afb5-58fef7864f54
+  resourceVersion: "289572"
+  uid: 471f07b7-fa68-4349-8118-d1e895ccafa5
 spec:
   devices:
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 0
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-18db0e85-99e9-c746-8531-ffeb86328b39
-      bindingConditions:
-        - BindingConditions
-      bindingFailureConditions:
-        - BindingFailureConditions
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-0
+  - attributes:
+      driverVersion:
+        version: 1.0.0
+      index:
+        int: 0
+      model:
+        string: LATEST-GPU-MODEL
+      uuid:
+        string: gpu-18db0e85-99e9-c746-8531-ffeb86328b39
+    capacity:
+      memory:
+        value: 80Gi
+    name: gpu-0
   driver: gpu.example.com
   nodeName: dra-example-driver-cluster-worker
   pool:
@@ -140,19 +199,76 @@ spec:
 
 </details>
 
-## Usage
+### 2. Deploy dra-driver-noop
 
-### 1. Deploy the controller
+Deploy [dra-driver-noop](https://github.com/gke-labs/dra-drivers/tree/main/dra-driver-noop) as a kubelet plugin for `image.example.com`. This no-op driver registers with the kubelet and returns success for all Prepare/Unprepare gRPC calls without doing any actual work. It is required because the kubelet must have a registered plugin for every driver name that appears in an allocation result.
+
+Follow the [dra-driver-noop README](https://github.com/gke-labs/dra-drivers/tree/main/dra-driver-noop) to deploy it with `driverNames: "image.example.com"`.
+
+### 3. Deploy the controller
+
+The controller publishes the `image.example.com` ResourceSlice and watches Pods for pending binding conditions.
 
 ```bash
 kubectl apply -f deploy/daemonset.yaml
 ```
 
-### 2. Create a ResourceClaimTemplate with a prioritized list
+After startup, an additional ResourceSlice appears:
+
+```
+NAME                          NODE     DRIVER              POOL
+00000-image.example.com-xxxxx  (none)   image.example.com   all-nodes
+```
+
+<details>
+<summary>Full ResourceSlice YAML (image.example.com)</summary>
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+metadata:
+  creationTimestamp: "2026-05-25T09:26:18Z"
+  generateName: 00000-image.example.com-
+  generation: 2
+  name: 00000-image.example.com-6thzv
+  resourceVersion: "171891"
+  uid: dd31ab58-3e26-4de5-8e3e-244b6ee7c8c2
+spec:
+  allNodes: true
+  devices:
+  - allowMultipleAllocations: true
+    bindingConditions:
+    - image-verified
+    bindingFailureConditions:
+    - image-prepare-failed
+    bindsToNode: false
+    name: image-configurator
+  driver: image.example.com
+  pool:
+    generation: 1
+    name: all-nodes
+    resourceSliceCount: 1
+```
+
+</details>
+
+### 4. Apply the DeviceClass
+
+```bash
+kubectl apply -f deploy/deviceclass.yaml
+```
+
+This creates a `DeviceClass` named `image.example.com` that selects devices from the `image.example.com` driver.
+
+## Usage
+
+### 1. Create a ResourceClaimTemplate with a prioritized list
 
 Use `firstAvailable` to specify a prioritized list of subrequests. The scheduler will try them in order and pick the first one that can be satisfied. Each subrequest references a different DeviceClass.
 
-The `config` section uses the `<main request>/<subrequest>` format to apply `ImageConfig` to the specific subrequest that gets chosen.
+The template also declares an `image-config` request targeting `image.example.com`. This is the gating device that carries `BindingConditions`, blocking Pod startup until the controller has mutated the image.
+
+The `config` section uses the `<main request>/<subrequest>` format to attach opaque parameters to each subrequest. The controller reads these parameters — typed as `ImageConfig` — to determine which image to set when the corresponding subrequest is chosen.
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -169,6 +285,9 @@ spec:
               deviceClassName: gpu.example.com
             - name: cpu
               deviceClassName: cpu.example.com
+        - name: image-config
+          exactly:
+            deviceClassName: image.example.com
       config:
         - requests: ["device/gpu"]
           opaque:
@@ -188,7 +307,7 @@ spec:
               image: ubuntu:latest
 ```
 
-### 3. Create a Pod referencing the claim
+### 2. Create a Pod referencing the claim
 
 ```yaml
 apiVersion: v1
@@ -199,7 +318,8 @@ spec:
   terminationGracePeriodSeconds: 0
   containers:
     - name: app
-      image: busybox:latest  # will be overwritten by the controller
+      image: busybox:latest  # will be mutated by the controller
+      imagePullPolicy: IfNotPresent
       command: ["sleep", "infinity"]
       resources:
         claims:
@@ -209,17 +329,17 @@ spec:
       resourceClaimTemplateName: gpu-or-cpu
 ```
 
-### 4. Verify the behavior
+### 3. Verify the behavior
 
-This scenario demonstrates the prioritized allocation and image patching:
+This scenario demonstrates the prioritized allocation and image mutation:
 
-- The first Pod (`my-app-1`) is allocated a GPU device because `gpu.example.com` has the highest priority in `firstAvailable`. The controller reads the matching `ImageConfig` and patches the container image from `busybox:latest` to `fedora:latest`.
-- The second Pod (`my-app-2`) cannot get a GPU because it is already occupied by `my-app-1`. The scheduler falls back to `cpu.example.com` via the prioritized list, and the controller patches the container image from `busybox:latest` to `ubuntu:latest`.
+- The first Pod (`my-app-1`) is allocated a GPU device because `gpu.example.com` has the highest priority in `firstAvailable`. The controller reads the matching config and mutates the container image from `busybox:latest` to `fedora:latest`.
+- The second Pod (`my-app-2`) cannot get a GPU because it is already occupied by `my-app-1`. The scheduler falls back to `cpu.example.com` via the prioritized list, and the controller mutates the container image from `busybox:latest` to `ubuntu:latest`.
 
 **Step 1: Create the first Pod**
 
 ```bash
-$ kubectl apply -f pod-1.yaml
+$ kubectl apply -f demo/pod-1.yaml
 pod/my-app-1 created
 ```
 
@@ -237,7 +357,7 @@ $ kubectl get resourceclaim my-app-1-device-r8m2x -o jsonpath='{.status}' | jq .
 ```json
 {
   "allocation": {
-    "allocationTimestamp": "2026-05-19T08:44:31Z",
+    "allocationTimestamp": "2026-05-27T05:55:01Z",
     "devices": {
       "config": [
         {
@@ -256,12 +376,18 @@ $ kubectl get resourceclaim my-app-1-device-r8m2x -o jsonpath='{.status}' | jq .
       ],
       "results": [
         {
-          "bindingConditions": ["BindingConditions"],
-          "bindingFailureConditions": ["BindingFailureConditions"],
           "device": "gpu-0",
           "driver": "gpu.example.com",
           "pool": "dra-example-driver-cluster-worker",
           "request": "device/gpu"
+        },
+        {
+          "bindingConditions": ["image-verified"],
+          "bindingFailureConditions": ["image-prepare-failed"],
+          "device": "image-configurator",
+          "driver": "image.example.com",
+          "pool": "all-nodes",
+          "request": "image-config"
         }
       ]
     },
@@ -283,16 +409,16 @@ $ kubectl get resourceclaim my-app-1-device-r8m2x -o jsonpath='{.status}' | jq .
     {
       "conditions": [
         {
-          "lastTransitionTime": "2026-05-19T08:44:31Z",
+          "lastTransitionTime": "2026-05-27T05:55:02Z",
           "message": "Container image has been updated",
           "reason": "ImagePatched",
           "status": "True",
-          "type": "BindingConditions"
+          "type": "image-verified"
         }
       ],
-      "device": "gpu-0",
-      "driver": "gpu.example.com",
-      "pool": "dra-example-driver-cluster-worker"
+      "device": "image-configurator",
+      "driver": "image.example.com",
+      "pool": "all-nodes"
     }
   ],
   "reservedFor": [
@@ -307,7 +433,7 @@ $ kubectl get resourceclaim my-app-1-device-r8m2x -o jsonpath='{.status}' | jq .
 
 </details>
 
-**Step 3: Confirm the first Pod's image is patched**
+**Step 3: Confirm the first Pod's image is mutated**
 
 ```bash
 $ kubectl get pod my-app-1 -o jsonpath='{.spec.containers[0].image}'
@@ -325,7 +451,7 @@ my-app-1   1/1     Running   0          30s
 **Step 5: Create the second Pod**
 
 ```bash
-$ kubectl apply -f pod-2.yaml
+$ kubectl apply -f demo/pod-2.yaml
 pod/my-app-2 created
 ```
 
@@ -343,7 +469,7 @@ $ kubectl get resourceclaim my-app-2-device-4knq7 -o jsonpath='{.status}' | jq .
 ```json
 {
   "allocation": {
-    "allocationTimestamp": "2026-05-19T08:44:35Z",
+    "allocationTimestamp": "2026-05-27T05:55:05Z",
     "devices": {
       "config": [
         {
@@ -362,12 +488,18 @@ $ kubectl get resourceclaim my-app-2-device-4knq7 -o jsonpath='{.status}' | jq .
       ],
       "results": [
         {
-          "bindingConditions": ["BindingConditions"],
-          "bindingFailureConditions": ["BindingFailureConditions"],
           "device": "gpu-0",
           "driver": "cpu.example.com",
           "pool": "dra-example-driver-cluster-worker",
           "request": "device/cpu"
+        },
+        {
+          "bindingConditions": ["image-verified"],
+          "bindingFailureConditions": ["image-prepare-failed"],
+          "device": "image-configurator",
+          "driver": "image.example.com",
+          "pool": "all-nodes",
+          "request": "image-config"
         }
       ]
     },
@@ -389,16 +521,16 @@ $ kubectl get resourceclaim my-app-2-device-4knq7 -o jsonpath='{.status}' | jq .
     {
       "conditions": [
         {
-          "lastTransitionTime": "2026-05-19T08:44:35Z",
+          "lastTransitionTime": "2026-05-27T05:55:06Z",
           "message": "Container image has been updated",
           "reason": "ImagePatched",
           "status": "True",
-          "type": "BindingConditions"
+          "type": "image-verified"
         }
       ],
-      "device": "gpu-0",
-      "driver": "cpu.example.com",
-      "pool": "dra-example-driver-cluster-worker"
+      "device": "image-configurator",
+      "driver": "image.example.com",
+      "pool": "all-nodes"
     }
   ],
   "reservedFor": [
@@ -413,7 +545,7 @@ $ kubectl get resourceclaim my-app-2-device-4knq7 -o jsonpath='{.status}' | jq .
 
 </details>
 
-**Step 7: Confirm the second Pod's image is patched**
+**Step 7: Confirm the second Pod's image is mutated**
 
 ```bash
 $ kubectl get pod my-app-2 -o jsonpath='{.spec.containers[0].image}'
@@ -428,9 +560,9 @@ NAME       READY   STATUS    RESTARTS   AGE
 my-app-2   1/1     Running   0          25s
 ```
 
-## ImageConfig Schema
+## ImageConfig schema
 
-The opaque parameters must conform to:
+The opaque parameters in the `config` section must conform to the `ImageConfig` type defined by this controller:
 
 ```json
 {
@@ -440,6 +572,8 @@ The opaque parameters must conform to:
   "image": "<desired container image>"
 }
 ```
+
+`containerName` must match exactly one container in the Pod's `spec.containers`.
 
 ## License
 
