@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app-4
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: app
+      image: busybox:latest  # will be overwritten by the controller
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      resources:
+        claims:
+          - name: device
+  resourceClaims:
+    - name: device
+      resourceClaimTemplateName: gpu-or-cpu-2
+    - name: image-config
+      resourceClaimTemplateName: image-config
+      

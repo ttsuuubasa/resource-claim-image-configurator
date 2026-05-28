@@ -262,6 +262,8 @@ This creates a `DeviceClass` named `image.example.com` that selects devices from
 
 ## Usage
 
+### Scenario 1: ImageConfig and BindingCondition in a single ResourceClaim
+
 ### 1. Create a ResourceClaimTemplate with a prioritized list
 
 Use `firstAvailable` to specify a prioritized list of subrequests. The scheduler will try them in order and pick the first one that can be satisfied. Each subrequest references a different DeviceClass.
@@ -339,7 +341,7 @@ This scenario demonstrates the prioritized allocation and image mutation:
 **Step 1: Create the first Pod**
 
 ```bash
-$ kubectl apply -f demo/pod-1.yaml
+$ kubectl apply -f demo/scenario-1/pod-1.yaml
 pod/my-app-1 created
 ```
 
@@ -451,7 +453,7 @@ my-app-1   1/1     Running   0          30s
 **Step 5: Create the second Pod**
 
 ```bash
-$ kubectl apply -f demo/pod-2.yaml
+$ kubectl apply -f demo/scenario-1/pod-2.yaml
 pod/my-app-2 created
 ```
 

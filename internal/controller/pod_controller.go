@@ -32,12 +32,10 @@ func (r *PodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// claimPatch holds a ResourceClaim, the resolved ImageConfig to apply, and the
-// result whose binding condition must be satisfied afterward.
-type claimPatch struct {
-	Claim          *resourceapi.ResourceClaim
-	ImageConfigs   []*imagev1alpha1.ImageConfig
-	BindingResults []resourceapi.DeviceRequestAllocationResult
+// claimBindingResult pairs a ResourceClaim with its pending binding results.
+type claimBindingResult struct {
+	Claim   *resourceapi.ResourceClaim
+	Results []resourceapi.DeviceRequestAllocationResult
 }
 
 // Reconcile handles a single Pod event.
@@ -49,22 +47,28 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
-	patches, err := r.parseImageConfigs(ctx, &pod)
+	claims, err := r.fetchClaims(ctx, &pod)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if len(patches) == 0 {
+
+	bindingResults := collectPendingBindingResults(claims)
+	if len(bindingResults) == 0 {
 		return reconcile.Result{}, nil
 	}
 
-	if err := r.patchImages(ctx, &pod, patches); err != nil {
+	imageConfigs := collectImageConfigs(claims)
+	if len(imageConfigs) == 0 {
+		return reconcile.Result{}, nil
+	}
+
+	if err := r.patchImages(ctx, &pod, imageConfigs); err != nil {
 		return reconcile.Result{}, err
 	}
 	log.Info("image patched", "pod", req.NamespacedName)
 
-	// Mark binding conditions as satisfied.
-	for _, p := range patches {
-		if err := r.setBindingConditions(ctx, p); err != nil {
+	for _, cbr := range bindingResults {
+		if err := r.setBindingCondition(ctx, cbr); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
@@ -72,76 +76,70 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 	return reconcile.Result{}, nil
 }
 
-// parseImageConfigs fetches ResourceClaims referenced by the pod and returns
-// claimPatch entries containing the configs to apply and the results whose
-// binding condition needs to be satisfied afterward.
-func (r *PodReconciler) parseImageConfigs(ctx context.Context, pod *corev1.Pod) ([]claimPatch, error) {
-	decoder := imagev1alpha1.Codec.UniversalDeserializer()
-
-	var patches []claimPatch
-
+// fetchClaims returns all ResourceClaims referenced by the pod.
+func (r *PodReconciler) fetchClaims(ctx context.Context, pod *corev1.Pod) ([]*resourceapi.ResourceClaim, error) {
+	var claims []*resourceapi.ResourceClaim
 	for _, rcs := range pod.Status.ResourceClaimStatuses {
 		claimKey := types.NamespacedName{
 			Namespace: pod.Namespace,
 			Name:      *rcs.ResourceClaimName,
 		}
-		var claim resourceapi.ResourceClaim
-		if err := r.Client.Get(ctx, claimKey, &claim); err != nil {
+		claim := &resourceapi.ResourceClaim{}
+		if err := r.Client.Get(ctx, claimKey, claim); err != nil {
 			return nil, fmt.Errorf("get claim %s: %w", claimKey, err)
 		}
 		if claim.Status.Allocation == nil {
 			return nil, fmt.Errorf("claim %s not yet allocated", claimKey)
 		}
+		claims = append(claims, claim)
+	}
+	return claims, nil
+}
 
-		allocatedDevices := claim.Status.Allocation.Devices
-
-		// Find requests whose "validate-image" condition is still pending.
-		var bindingResults []resourceapi.DeviceRequestAllocationResult
-		for _, result := range allocatedDevices.Results {
+// collectPendingBindingResults returns per-claim pending binding results where the
+// "image-verified" binding condition is required but not yet satisfied.
+func collectPendingBindingResults(claims []*resourceapi.ResourceClaim) []claimBindingResult {
+	var pending []claimBindingResult
+	for _, claim := range claims {
+		var results []resourceapi.DeviceRequestAllocationResult
+		for _, result := range claim.Status.Allocation.Devices.Results {
 			if !slices.Contains(result.BindingConditions, BindingConditionValidateImage) {
 				continue
 			}
-			if isBindingConditionAlreadySet(&claim, &result, BindingConditionValidateImage) {
+			if isBindingConditionAlreadySet(claim, &result, BindingConditionValidateImage) {
 				continue
 			}
-			bindingResults = append(bindingResults, result)
+			results = append(results, result)
 		}
-		if len(bindingResults) == 0 {
-			continue
-		}
-
-		// For each pending result, find the config targeting it.
-		var imageConfigs []*imagev1alpha1.ImageConfig
-		for _, result := range allocatedDevices.Results {
-			for _, cfg := range allocatedDevices.Config {
-				if cfg.Opaque == nil || cfg.Opaque.Parameters.Raw == nil {
-					continue
-				}
-				if len(cfg.Requests) > 0 && !slices.Contains(cfg.Requests, result.Request) {
-					continue
-				}
-				obj, _, err := decoder.Decode(cfg.Opaque.Parameters.Raw, nil, nil)
-				if err != nil {
-					continue
-				}
-				ic, ok := obj.(*imagev1alpha1.ImageConfig)
-				if !ok || ic.ContainerName == "" || ic.Image == "" {
-					continue
-				}
-				imageConfigs = append(imageConfigs, ic)
-			}
-		}
-
-		if len(imageConfigs) > 0 {
-			patches = append(patches, claimPatch{
-				Claim:          &claim,
-				ImageConfigs:   imageConfigs,
-				BindingResults: bindingResults,
-			})
+		if len(results) > 0 {
+			pending = append(pending, claimBindingResult{Claim: claim, Results: results})
 		}
 	}
+	return pending
+}
 
-	return patches, nil
+// collectImageConfigs extracts all ImageConfig objects from the allocated device
+// configs across all claims.
+func collectImageConfigs(claims []*resourceapi.ResourceClaim) []*imagev1alpha1.ImageConfig {
+	decoder := imagev1alpha1.Codec.UniversalDeserializer()
+	var imageConfigs []*imagev1alpha1.ImageConfig
+	for _, claim := range claims {
+		for _, cfg := range claim.Status.Allocation.Devices.Config {
+			if cfg.Opaque == nil || cfg.Opaque.Parameters.Raw == nil {
+				continue
+			}
+			obj, _, err := decoder.Decode(cfg.Opaque.Parameters.Raw, nil, nil)
+			if err != nil {
+				continue
+			}
+			ic, ok := obj.(*imagev1alpha1.ImageConfig)
+			if !ok || ic.ContainerName == "" || ic.Image == "" {
+				continue
+			}
+			imageConfigs = append(imageConfigs, ic)
+		}
+	}
+	return imageConfigs
 }
 
 // isBindingConditionAlreadySet checks whether the given condition is already
@@ -160,14 +158,12 @@ func isBindingConditionAlreadySet(claim *resourceapi.ResourceClaim, result *reso
 	return false
 }
 
-// patchImages updates container images on the pod according to the provided claimPatches.
-func (r *PodReconciler) patchImages(ctx context.Context, pod *corev1.Pod, patches []claimPatch) error {
+// patchImages updates container images on the pod according to the provided ImageConfigs.
+func (r *PodReconciler) patchImages(ctx context.Context, pod *corev1.Pod, imageConfigs []*imagev1alpha1.ImageConfig) error {
 	for i := range pod.Spec.Containers {
-		for _, p := range patches {
-			for _, ic := range p.ImageConfigs {
-				if pod.Spec.Containers[i].Name == ic.ContainerName {
-					pod.Spec.Containers[i].Image = ic.Image
-				}
+		for _, ic := range imageConfigs {
+			if pod.Spec.Containers[i].Name == ic.ContainerName {
+				pod.Spec.Containers[i].Image = ic.Image
 			}
 		}
 	}
@@ -177,12 +173,12 @@ func (r *PodReconciler) patchImages(ctx context.Context, pod *corev1.Pod, patche
 	return nil
 }
 
-// setBindingConditions sets the "validate-image" binding condition to True
-// on the claim's Status.Devices for each binding result in the patch.
-func (r *PodReconciler) setBindingConditions(ctx context.Context, cp claimPatch) error {
+// setBindingCondition sets the "image-verified" binding condition to True
+// on the claim's Status.Devices for all pending binding results in a single update.
+func (r *PodReconciler) setBindingCondition(ctx context.Context, cbr claimBindingResult) error {
 	now := metav1.Now()
-	for _, result := range cp.BindingResults {
-		cp.Claim.Status.Devices = append(cp.Claim.Status.Devices, resourceapi.AllocatedDeviceStatus{
+	for _, result := range cbr.Results {
+		cbr.Claim.Status.Devices = append(cbr.Claim.Status.Devices, resourceapi.AllocatedDeviceStatus{
 			Driver:  result.Driver,
 			Pool:    result.Pool,
 			Device:  result.Device,
@@ -196,8 +192,8 @@ func (r *PodReconciler) setBindingConditions(ctx context.Context, cp claimPatch)
 			}},
 		})
 	}
-	if err := r.Client.Status().Update(ctx, cp.Claim); err != nil {
-		return fmt.Errorf("update claim status %s/%s: %w", cp.Claim.Namespace, cp.Claim.Name, err)
+	if err := r.Client.Status().Update(ctx, cbr.Claim); err != nil {
+		return fmt.Errorf("update claim status %s/%s: %w", cbr.Claim.Namespace, cbr.Claim.Name, err)
 	}
 	return nil
 }

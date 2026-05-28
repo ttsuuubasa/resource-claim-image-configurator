@@ -1,0 +1,11 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: image-config
+spec:
+  spec:
+    devices:
+      requests:
+        - name: image-config
+          exactly:
+            deviceClassName: image.example.com
