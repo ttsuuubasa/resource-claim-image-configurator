@@ -1,4 +1,4 @@
-IMAGE ?= registry.k8s.io/resource-claim-image-configurator
+IMAGE ?= registry.k8s.io/dra-driver-image-configurator
 TAG ?= latest
 
 .PHONY: docker-build

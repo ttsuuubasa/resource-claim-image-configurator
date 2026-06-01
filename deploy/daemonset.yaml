@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: resource-claim-image-configurator
+  name: dra-driver-image-configurator
   namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: resource-claim-image-configurator
+  name: dra-driver-image-configurator
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -29,34 +29,34 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: resource-claim-image-configurator
+  name: dra-driver-image-configurator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: resource-claim-image-configurator
+  name: dra-driver-image-configurator
 subjects:
   - kind: ServiceAccount
-    name: resource-claim-image-configurator
+    name: dra-driver-image-configurator
     namespace: kube-system
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: resource-claim-image-configurator
+  name: dra-driver-image-configurator
   namespace: kube-system
 spec:
   selector:
     matchLabels:
-      app: resource-claim-image-configurator
+      app: dra-driver-image-configurator
   template:
     metadata:
       labels:
-        app: resource-claim-image-configurator
+        app: dra-driver-image-configurator
     spec:
-      serviceAccountName: resource-claim-image-configurator
+      serviceAccountName: dra-driver-image-configurator
       containers:
         - name: controller
-          image: registry.k8s.io/resource-claim-image-configurator:latest
+          image: registry.k8s.io/dra-driver-image-configurator:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_NAME

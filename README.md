@@ -1,4 +1,4 @@
-# resource-claim-image-configurator
+# dra-driver-image-configurator
 
 Proof-of-concept controller demonstrating how DRA Device Binding Conditions (KEP-5007) can enable workload fungibility — allowing the runtime container image to be selected automatically based on which device the scheduler actually allocates.
 
@@ -69,7 +69,7 @@ graph TB
             dra_noop["dra-driver-noop\nimage.example.com"]
         end
 
-        controller["resource-claim-image-configurator"]
+        controller["dra-driver-image-configurator"]
     end
 
     dra_example -- "publishes ResourceSlice" --> apiserver
@@ -86,7 +86,7 @@ graph TB
 |---|---|
 | **dra-example-driver** | Kubelet plugin for `gpu.example.com` and `cpu.example.com`. Publishes ResourceSlices with device attributes. No `BindingConditions` on these devices. |
 | **[dra-driver-noop](https://github.com/gke-labs/dra-drivers/tree/main/dra-driver-noop)** | Kubelet plugin for `image.example.com`. Registers with the kubelet and returns success for all Prepare/Unprepare calls without doing anything. Required because the kubelet must have a registered plugin for each driver name that appears in an allocation result. |
-| **resource-claim-image-configurator** (this controller) | Publishes a ResourceSlice for `image.example.com` with `bindingConditions: ["image-verified"]`. Watches Pods, mutates container images, and satisfies the binding condition. |
+| **dra-driver-image-configurator** (this controller) | Publishes a ResourceSlice for `image.example.com` with `bindingConditions: ["image-verified"]`. Watches Pods, mutates container images, and satisfies the binding condition. |
 
 The `image.example.com` ResourceSlice exposes a single shared device (`image-configurator`) with `allowMultipleAllocations: true` and `bindsToNode: false`, so it can be claimed by any number of Pods across all nodes simultaneously.
 

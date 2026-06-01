@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	controller "github.com/ttsuuubasa/resource-claim-image-configurator/internal/controller"
+	controller "github.com/ttsuuubasa/dra-driver-image-configurator/internal/controller"
 	"k8s.io/client-go/kubernetes"
 	resourceslice "k8s.io/dynamic-resource-allocation/resourceslice"
 )

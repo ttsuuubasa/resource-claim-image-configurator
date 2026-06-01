@@ -1,4 +1,4 @@
-module github.com/ttsuuubasa/resource-claim-image-configurator
+module github.com/ttsuuubasa/dra-driver-image-configurator
 
 go 1.26.0
 

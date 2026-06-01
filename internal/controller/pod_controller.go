@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	imagev1alpha1 "github.com/ttsuuubasa/resource-claim-image-configurator/api/v1alpha1"
+	imagev1alpha1 "github.com/ttsuuubasa/dra-driver-image-configurator/api/v1alpha1"
 )
 
 const BindingConditionValidateImage = "image-verified"
